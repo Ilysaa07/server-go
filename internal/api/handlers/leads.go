@@ -49,21 +49,24 @@ func (h *Handler) SyncContacts(c *gin.Context) {
 	ctx := context.Background()
 
 	// Sync app state to get latest labels (no QR reconnect needed!)
-	// Labels can be in different app state patches - try multiple
-	fmt.Printf("🏷️ [leads] Fetching app state for labels...\n")
+	// Labels can be in different app state patches - try multiple with fullSync=true
+	fmt.Printf("🏷️ [leads] Fetching app state for labels (fullSync=true)...\n")
+	
+	// Check if we already have labels - only do fullSync if empty
+	needsFullSync := len(h.WAManager.LabelStore.GetAllLabels()) == 0
 	
 	// Try Regular patch (most label data is here)
-	if err := client.WAClient.FetchAppState(ctx, appstate.WAPatchRegular, false, false); err != nil {
+	if err := client.WAClient.FetchAppState(ctx, appstate.WAPatchRegular, needsFullSync, false); err != nil {
 		fmt.Printf("⚠️ Failed to fetch WAPatchRegular: %v\n", err)
 	}
 	
 	// Try RegularLow patch
-	if err := client.WAClient.FetchAppState(ctx, appstate.WAPatchRegularLow, false, false); err != nil {
+	if err := client.WAClient.FetchAppState(ctx, appstate.WAPatchRegularLow, needsFullSync, false); err != nil {
 		fmt.Printf("⚠️ Failed to fetch WAPatchRegularLow: %v\n", err)
 	}
 	
 	// Try RegularHigh patch (label associations might be here)
-	if err := client.WAClient.FetchAppState(ctx, appstate.WAPatchRegularHigh, false, false); err != nil {
+	if err := client.WAClient.FetchAppState(ctx, appstate.WAPatchRegularHigh, needsFullSync, false); err != nil {
 		fmt.Printf("⚠️ Failed to fetch WAPatchRegularHigh: %v\n", err)
 	}
 	
