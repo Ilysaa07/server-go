@@ -49,12 +49,25 @@ func (h *Handler) SyncContacts(c *gin.Context) {
 	ctx := context.Background()
 
 	// Sync app state to get latest labels (no QR reconnect needed!)
-	// This fetches label data from WhatsApp servers
+	// Labels can be in different app state patches - try multiple
 	fmt.Printf("🏷️ [leads] Fetching app state for labels...\n")
-	if err := client.WAClient.FetchAppState(ctx, appstate.WAPatchCriticalUnblockLow, false, false); err != nil {
-		fmt.Printf("⚠️ Failed to fetch app state (non-fatal): %v\n", err)
-		// Continue anyway - we might have cached labels
+	
+	// Try Regular patch (most label data is here)
+	if err := client.WAClient.FetchAppState(ctx, appstate.WAPatchRegular, false, false); err != nil {
+		fmt.Printf("⚠️ Failed to fetch WAPatchRegular: %v\n", err)
 	}
+	
+	// Try RegularLow patch
+	if err := client.WAClient.FetchAppState(ctx, appstate.WAPatchRegularLow, false, false); err != nil {
+		fmt.Printf("⚠️ Failed to fetch WAPatchRegularLow: %v\n", err)
+	}
+	
+	// Try RegularHigh patch (label associations might be here)
+	if err := client.WAClient.FetchAppState(ctx, appstate.WAPatchRegularHigh, false, false); err != nil {
+		fmt.Printf("⚠️ Failed to fetch WAPatchRegularHigh: %v\n", err)
+	}
+	
+	fmt.Printf("🏷️ [leads] App state fetch completed. Labels in store: %d\n", len(h.WAManager.LabelStore.GetAllLabels()))
 
 	// Get all contacts first
 	contacts, err := client.WAClient.Store.Contacts.GetAllContacts(ctx)
