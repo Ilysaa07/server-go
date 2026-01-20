@@ -135,9 +135,10 @@ func (h *Handler) SyncContacts(c *gin.Context) {
 			}
 
 			result = append(result, map[string]interface{}{
-				"id":   displayID,
-				"name": name,
-				"type": "user",
+				"id":    displayID,
+				"name":  name,
+				"phone": displayID, // Added for frontend compatibility
+				"type":  "user",
 			})
 		}
 	} else {
@@ -157,9 +158,10 @@ func (h *Handler) SyncContacts(c *gin.Context) {
 			formattedID := strings.Replace(jid.User, "@s.whatsapp.net", "", -1)
 
 			result = append(result, map[string]interface{}{
-				"id":   formattedID,
-				"name": name,
-				"type": "user",
+				"id":    formattedID,
+				"name":  name,
+				"phone": formattedID, // Added for frontend compatibility
+				"type":  "user",
 			})
 		}
 	}
