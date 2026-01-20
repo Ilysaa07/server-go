@@ -295,7 +295,11 @@ func (m *Manager) handleEvent(clientID string, client *Client, evt interface{}) 
 		// Track which contacts have which labels
 		fmt.Printf("🏷️ [%s] LabelAssociationChat event received! LabelID=%s, JID=%s, Action=%+v\n", 
 			clientID, v.LabelID, v.JID.String(), v.Action)
-		jid := v.JID.User
+		
+		// IMPORTANT: Store FULL JID (including @s.whatsapp.net or @lid)
+		// This is crucial to distinguishing between Phone JIDs and Device LIDs
+		jid := v.JID.String() 
+
 		if v.Action != nil && v.Action.GetLabeled() {
 			m.LabelStore.AddAssociation(v.LabelID, jid)
 			fmt.Printf("🏷️ [%s] Label %s ADDED to contact %s\n", clientID, v.LabelID, jid)

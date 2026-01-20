@@ -103,13 +103,20 @@ func (h *Handler) SyncContacts(c *gin.Context) {
 		fmt.Printf("🏷️ Filtering mode: Iterating through %d labeled JIDs\n", len(labeledJIDs))
 		
 		for _, targetJID := range labeledJIDs {
-			// Construct JID object
-			jid, _ := types.ParseJID(targetJID + "@s.whatsapp.net") // adjust suffix if needed
+			// targetJID is now the FULL JID (e.g. 628123@s.whatsapp.net OR 12345@lid)
+			jid, err := types.ParseJID(targetJID)
+			if err != nil {
+				// Fallback for backward compatibility if old data exists (just user part)
+				jid, _ = types.ParseJID(targetJID + "@s.whatsapp.net")
+			}
 			
 			// Try to find contact info
 			contact, err := client.WAClient.Store.Contacts.GetContact(ctx, jid)
 			
-			name := targetJID // Default to number
+			// Determine name and display ID
+			name := jid.User // Default name is the user number/ID
+			displayID := jid.User
+			
 			if err == nil && contact.Found {
 				if contact.FullName != "" {
 					name = contact.FullName
@@ -117,12 +124,18 @@ func (h *Handler) SyncContacts(c *gin.Context) {
 					name = contact.PushName
 				}
 			}
+
 			
-			// Formatted number
-			formattedID := strings.Replace(targetJID, "@s.whatsapp.net", "", -1)
+			// Special handling for LIDs (Bot linked device IDs)
+			if jid.Server == "lid" {
+				fmt.Printf("🏷️ Found LID: %s. Using Name if available.\n", jid)
+			} else {
+				// Checks if it looks like a phone number
+				displayID = strings.Replace(displayID, "@s.whatsapp.net", "", -1)
+			}
 
 			result = append(result, map[string]interface{}{
-				"id":   formattedID,
+				"id":   displayID,
 				"name": name,
 				"type": "user",
 			})
