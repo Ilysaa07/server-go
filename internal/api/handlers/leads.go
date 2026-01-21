@@ -415,95 +415,129 @@ func (h *Handler) SyncContactsStream(c *gin.Context) {
 	}
 
 	// Process LIDs - get contact info from store directly (GetUserInfo doesn't return phone mapping)
-	fmt.Printf("🏷️ Processing %d LIDs (Network Resolution Mode)...\n", len(lidJIDs))
+	// Initialize Cache
+	cachePath := "lid_mapping.json"
+	lidCache := utils.NewLIDCache(cachePath)
+	_ = lidCache.Load()
+
+	// Process LIDs
+	fmt.Printf("🏷️ Processing %d LIDs (Smart Cache Mode)...\n", len(lidJIDs))
 	
-	// Map to track resolved ID for each LID
+	// Separate Cached vs Uncached
+	var uncachedLIDs []types.JID
 	lidToResolvedID := make(map[string]string)
-	// Collect LIDs for async profile pic fetch
 	var pendingPics []types.JID
-	
-	// Batch process LIDs for GetUserInfo
-	batchSize := 5 // Conservative batch size
-	delayBetweenBatches := 2 * time.Second
-	
-	for i := 0; i < len(lidJIDs); i += batchSize {
-		end := i + batchSize
-		if end > len(lidJIDs) {
-			end = len(lidJIDs)
-		}
-		batch := lidJIDs[i:end]
+
+	for _, lidJID := range lidJIDs {
+		// Default to LID
+		lidToResolvedID[lidJID.User] = lidJID.User
 		
-		fmt.Printf("🔄 Resolving batch %d-%d of %d...\n", i+1, end, len(lidJIDs))
-		
-		// Map for this batch to store resolved results
-		batchResults := make(map[string]string) // LID -> Phone
-		
-		// 1. Try Network Resolution (Best Practice)
-		resp, err := client.WAClient.GetUserInfo(ctx, batch)
-		if err != nil {
-			fmt.Printf("⚠️ Batch GetUserInfo failed: %v. Falling back to local/utils.\n", err)
-			// Fallback will happen below per item
+		// Check Cache
+		if phone, found := lidCache.Get(lidJID.User); found {
+			lidToResolvedID[lidJID.User] = phone
+			// fmt.Printf("   💾 Cached: %s -> %s\n", lidJID.User, phone)
 		} else {
-			for lidJID, info := range resp {
-				for _, device := range info.Devices {
-					if device.Server == "s.whatsapp.net" {
-						batchResults[lidJID.User] = device.User
-						fmt.Printf("   ✅ Resolved: %s -> %s\n", lidJID.User, device.User)
-						break
+			uncachedLIDs = append(uncachedLIDs, lidJID)
+		}
+		pendingPics = append(pendingPics, lidJID)
+	}
+	
+	fmt.Printf("📦 Cached: %d, Needing Resolution: %d\n", len(lidJIDs)-len(uncachedLIDs), len(uncachedLIDs))
+
+	// Batch process ONLY uncached LIDs
+	if len(uncachedLIDs) > 0 {
+		batchSize := 2
+		// No fixed delay, we use dynamic backoff
+		
+		for i := 0; i < len(uncachedLIDs); i += batchSize {
+			end := i + batchSize
+			if end > len(uncachedLIDs) {
+				end = len(uncachedLIDs)
+			}
+			batch := uncachedLIDs[i:end]
+			
+			// Retry Logic with Exponential Backoff
+			maxRetries := 5
+			baseDelay := 2 * time.Second
+			success := false
+			
+			for attempt := 0; attempt < maxRetries; attempt++ {
+				// fmt.Printf("🔄 Resolving batch %d-%d (Attempt %d)...\n", i+1, end, attempt+1)
+				
+				resp, err := client.WAClient.GetUserInfo(ctx, batch)
+				if err != nil {
+					// Check for rate limit
+					isRateLimit := strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate-overlimit")
+					
+					wait := baseDelay * time.Duration(1<<attempt) // 2s, 4s, 8s...
+					if isRateLimit {
+						fmt.Printf("⚠️ Rate Limit (429). Waiting %v...\n", wait)
+					} else {
+						fmt.Printf("⚠️ Network Error: %v. Waiting %v...\n", err, wait)
+					}
+					
+					time.Sleep(wait)
+					continue
+				}
+				
+				// Success
+				for lidJID, info := range resp {
+					for _, device := range info.Devices {
+						if device.Server == "s.whatsapp.net" {
+							// Update Map & Cache
+							lidToResolvedID[lidJID.User] = device.User
+							lidCache.Set(lidJID.User, device.User)
+							fmt.Printf("   ✅ Resolved: %s -> %s\n", lidJID.User, device.User)
+							break
+						}
 					}
 				}
+				success = true
+				break
 			}
+			
+			if !success {
+				fmt.Printf("❌ Failed to resolve batch completely after retries.\n")
+			}
+			
+			// Small basic delay between successful batches too
+			time.Sleep(1 * time.Second)
 		}
+	}
 
-		// 2. Process each LID in batch with results or fallback
-		for _, lidJID := range batch {
-			// Determine initial name from local store
-			contact, _ := client.WAClient.Store.Contacts.GetContact(ctx, lidJID)
-			name := lidJID.User
-			if contact.Found {
-				if contact.PushName != "" {
-					name = contact.PushName
-				} else if contact.FullName != "" {
-					name = contact.FullName
-				} else if contact.BusinessName != "" {
-					name = contact.BusinessName
-				}
+	// Send Events
+	for _, lidJID := range lidJIDs {
+		// Get local name info
+		contact, _ := client.WAClient.Store.Contacts.GetContact(ctx, lidJID)
+		name := lidJID.User
+		if contact.Found {
+			if contact.PushName != "" {
+				name = contact.PushName
+			} else if contact.FullName != "" {
+				name = contact.FullName
+			} else if contact.BusinessName != "" {
+				name = contact.BusinessName
 			}
-
-			// Final Resolution Strategy
-			displayID := lidJID.User
-			
-			// Priority 1: Network Result
-			if phone, ok := batchResults[lidJID.User]; ok {
-				displayID = phone
-			} else {
-				// Priority 2: Local Utils Helper (Fallback)
-				resolvedNum, err := utils.ResolveLIDToPhoneNumber(client.WAClient, lidJID)
-				if err == nil && resolvedNum != "" {
-					displayID = resolvedNum
-				}
-			}
-			
-			// Track mapping for profile pic update later
-			lidToResolvedID[lidJID.User] = displayID
-			
-			// Queue for profile pic
-			pendingPics = append(pendingPics, lidJID)
-			
-			sendEvent("contact", gin.H{
-				"id":            displayID,
-				"name":          name,
-				"phone":         displayID,
-				"type":          "lid",
-				"isLID":         true,
-				"profilePicUrl": "", // Will be updated async
-			})
-			processedCount++
 		}
 		
-		// Rate limit protection
-		if end < len(lidJIDs) {
-			time.Sleep(delayBetweenBatches)
+		displayID := lidToResolvedID[lidJID.User]
+		
+		sendEvent("contact", gin.H{
+			"id":            displayID,
+			"name":          name,
+			"phone":         displayID,
+			"type":          "lid",
+			"isLID":         true,
+			"profilePicUrl": "", // Will be updated async
+		})
+		processedCount++
+		
+		if processedCount % 20 == 0 {
+			sendEvent("progress", gin.H{
+				"current": processedCount,
+				"total":   len(labeledJIDs),
+				"message": fmt.Sprintf("Processed %d/%d contacts", processedCount, len(labeledJIDs)),
+			})
 		}
 	}
 
