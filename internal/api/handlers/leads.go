@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.mau.fi/whatsmeow/appstate"
@@ -102,76 +103,145 @@ func (h *Handler) SyncContacts(c *gin.Context) {
 		// STRATEGY A: If we have labeled leads, iterate through THEM
 		fmt.Printf("🏷️ Filtering mode: Iterating through %d labeled JIDs\n", len(labeledJIDs))
 		
+		// Step 1: Separate LIDs and regular JIDs
+		var lidJIDs []types.JID
+		var regularJIDs []types.JID
+		
 		for _, targetJID := range labeledJIDs {
-			// targetJID is now the FULL JID (e.g. 628123@s.whatsapp.net OR 12345@lid)
 			jid, err := types.ParseJID(targetJID)
 			if err != nil {
-				// Fallback for backward compatibility if old data exists (just user part)
 				jid, _ = types.ParseJID(targetJID + "@s.whatsapp.net")
 			}
 			
-			// Try to find contact info
-			contact, err := client.WAClient.Store.Contacts.GetContact(ctx, jid)
+			if jid.Server == "lid" {
+				lidJIDs = append(lidJIDs, jid)
+			} else {
+				regularJIDs = append(regularJIDs, jid)
+			}
+		}
+		
+		fmt.Printf("🏷️ Found %d LIDs and %d regular JIDs\n", len(lidJIDs), len(regularJIDs))
+		
+		// Step 2: Batch resolve LIDs (max 5 per batch to avoid rate limit)
+		lidToPhoneMap := make(map[string]string) // LID -> Phone number
+		lidToNameMap := make(map[string]string)  // LID -> Name
+		batchSize := 5
+		delayBetweenBatches := 2 * time.Second
+		
+		for i := 0; i < len(lidJIDs); i += batchSize {
+			end := i + batchSize
+			if end > len(lidJIDs) {
+				end = len(lidJIDs)
+			}
+			batch := lidJIDs[i:end]
 			
-			// Determine name and display ID
-			name := jid.User // Default name is the user number/ID
+			fmt.Printf("🔄 Processing LID batch %d-%d of %d...\n", i+1, end, len(lidJIDs))
+			
+			// Retry logic with exponential backoff
+			maxRetries := 3
+			retryDelay := 3 * time.Second
+			
+			for retry := 0; retry < maxRetries; retry++ {
+				resp, err := client.WAClient.GetUserInfo(ctx, batch)
+				if err != nil {
+					if strings.Contains(err.Error(), "rate-overlimit") || strings.Contains(err.Error(), "429") {
+						fmt.Printf("⚠️ Rate limited, waiting %v before retry %d/%d...\n", retryDelay, retry+1, maxRetries)
+						time.Sleep(retryDelay)
+						retryDelay *= 2 // Exponential backoff
+						continue
+					}
+					fmt.Printf("❌ GetUserInfo batch failed: %v\n", err)
+					break
+				}
+				
+				// Process successful responses
+				for lidJID, info := range resp {
+					// Look for phone JID in Devices list
+					for _, device := range info.Devices {
+						if device.Server == "s.whatsapp.net" {
+							lidToPhoneMap[lidJID.String()] = device.User
+							fmt.Printf("   ✅ LID %s -> Phone %s\n", lidJID.User, device.User)
+							
+							// Try to get contact name from phone JID
+							if phContact, err := client.WAClient.Store.Contacts.GetContact(ctx, device); err == nil && phContact.Found {
+								if phContact.FullName != "" {
+									lidToNameMap[lidJID.String()] = phContact.FullName
+								} else if phContact.PushName != "" {
+									lidToNameMap[lidJID.String()] = phContact.PushName
+								} else if phContact.BusinessName != "" {
+									lidToNameMap[lidJID.String()] = phContact.BusinessName
+								}
+							}
+							break
+						}
+					}
+					
+					// If no phone found in devices, check if we got a VerifiedName
+					if _, exists := lidToPhoneMap[lidJID.String()]; !exists {
+						if info.VerifiedName != nil && info.VerifiedName.Details != nil {
+							lidToNameMap[lidJID.String()] = info.VerifiedName.Details.GetVerifiedName()
+							fmt.Printf("   📛 LID %s has verified name: %s\n", lidJID.User, info.VerifiedName.Details.GetVerifiedName())
+						}
+					}
+				}
+				break // Success, exit retry loop
+			}
+			
+			// Wait before next batch to avoid rate limiting
+			if end < len(lidJIDs) {
+				fmt.Printf("⏳ Waiting %v before next batch...\n", delayBetweenBatches)
+				time.Sleep(delayBetweenBatches)
+			}
+		}
+		
+		// Step 3: Build result with resolved data
+		for _, targetJID := range labeledJIDs {
+			jid, err := types.ParseJID(targetJID)
+			if err != nil {
+				jid, _ = types.ParseJID(targetJID + "@s.whatsapp.net")
+			}
+			
+			name := jid.User
 			displayID := jid.User
 			
+			// Try to get contact info first
+			contact, err := client.WAClient.Store.Contacts.GetContact(ctx, jid)
 			if err == nil && contact.Found {
 				if contact.FullName != "" {
 					name = contact.FullName
 				} else if contact.PushName != "" {
 					name = contact.PushName
+				} else if contact.BusinessName != "" {
+					name = contact.BusinessName
 				}
 			}
-
 			
-			// Special handling for LIDs (Bot linked device IDs)
+			// For LIDs, use resolved phone number
 			if jid.Server == "lid" {
-				fmt.Printf("🏷️ Found LID: %s\n", jid)
-				fmt.Printf("   Contact Info: %+v\n", contact)
-				
-				// Resolve LID to Phone JID via Server Query
-				// Since we can't find a direct local map, let's ask WhatsApp
-				resp, err := client.WAClient.GetUserInfo(ctx, []types.JID{jid})
-				if err == nil {
-					if info, ok := resp[jid]; ok {
-						fmt.Printf("   ✅ GetUserInfo for LID %s: %+v\n", jid, info)
-						
-						// Often the UserInfo object itself is keyed by the requested JID (LID)
-						// But potentially we can find the Phone number in the Devices list?
-						// Or maybe the 'PictureID' isn't helpful.
-						
-						// Strategy C: If we have devices, maybe one of them is the phone?
-						for _, deviceB := range info.Devices {
-							if deviceB.Server == "s.whatsapp.net" {
-								fmt.Printf("   🔗 Found Phone JID in Devices: %s\n", deviceB)
-								displayID = deviceB.User
-								// Also update name from this contact if possible
-								if phContact, err := client.WAClient.Store.Contacts.GetContact(ctx, deviceB); err == nil && phContact.Found {
-									if phContact.FullName != "" {
-										name = phContact.FullName
-									} else {
-										name = phContact.PushName
-									}
-								}
-								break
-							}
-						}
-					}
-				} else {
-					fmt.Printf("   ❌ GetUserInfo failed for LID %s: %v\n", jid, err)
+				if phone, ok := lidToPhoneMap[jid.String()]; ok {
+					displayID = phone
 				}
-				
+				if resolvedName, ok := lidToNameMap[jid.String()]; ok && resolvedName != "" {
+					name = resolvedName
+				}
+				// If still no name, use phone or LID as fallback
+				if name == jid.User && displayID != jid.User {
+					name = displayID // Use phone number as name if no name found
+				}
 			} else {
-				// Checks if it looks like a phone number
 				displayID = strings.Replace(displayID, "@s.whatsapp.net", "", -1)
+			}
+			
+			// Only add if we have a valid phone number (skip unresolved LIDs)
+			if jid.Server == "lid" && displayID == jid.User {
+				fmt.Printf("⏭️ Skipping unresolved LID: %s\n", jid.User)
+				continue
 			}
 
 			result = append(result, map[string]interface{}{
 				"id":    displayID,
 				"name":  name,
-				"phone": displayID, // Added for frontend compatibility
+				"phone": displayID,
 				"type":  "user",
 			})
 		}
