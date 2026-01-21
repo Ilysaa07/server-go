@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
+	"wa-server-go/internal/utils"
 
 	"github.com/gin-gonic/gin"
 	"go.mau.fi/whatsmeow"
@@ -125,79 +125,7 @@ func (h *Handler) SyncContacts(c *gin.Context) {
 		
 		fmt.Printf("🏷️ Found %d LIDs and %d regular JIDs\n", len(lidJIDs), len(regularJIDs))
 		
-		// Step 2: Batch resolve LIDs (max 3 per batch to avoid rate limit)
-		lidToPhoneMap := make(map[string]string) // LID -> Phone number
-		lidToNameMap := make(map[string]string)  // LID -> Name
-		batchSize := 3
-		delayBetweenBatches := 5 * time.Second
-		
-		for i := 0; i < len(lidJIDs); i += batchSize {
-			end := i + batchSize
-			if end > len(lidJIDs) {
-				end = len(lidJIDs)
-			}
-			batch := lidJIDs[i:end]
-			
-			fmt.Printf("🔄 Processing LID batch %d-%d of %d...\n", i+1, end, len(lidJIDs))
-			
-			// Retry logic with exponential backoff
-			maxRetries := 3
-			retryDelay := 3 * time.Second
-			
-			for retry := 0; retry < maxRetries; retry++ {
-				resp, err := client.WAClient.GetUserInfo(ctx, batch)
-				if err != nil {
-					if strings.Contains(err.Error(), "rate-overlimit") || strings.Contains(err.Error(), "429") {
-						fmt.Printf("⚠️ Rate limited, waiting %v before retry %d/%d...\n", retryDelay, retry+1, maxRetries)
-						time.Sleep(retryDelay)
-						retryDelay *= 2 // Exponential backoff
-						continue
-					}
-					fmt.Printf("❌ GetUserInfo batch failed: %v\n", err)
-					break
-				}
-				
-				// Process successful responses
-				for lidJID, info := range resp {
-					// Look for phone JID in Devices list
-					for _, device := range info.Devices {
-						if device.Server == "s.whatsapp.net" {
-							lidToPhoneMap[lidJID.String()] = device.User
-							fmt.Printf("   ✅ LID %s -> Phone %s\n", lidJID.User, device.User)
-							
-							// Try to get contact name from phone JID
-							if phContact, err := client.WAClient.Store.Contacts.GetContact(ctx, device); err == nil && phContact.Found {
-								if phContact.FullName != "" {
-									lidToNameMap[lidJID.String()] = phContact.FullName
-								} else if phContact.PushName != "" {
-									lidToNameMap[lidJID.String()] = phContact.PushName
-								} else if phContact.BusinessName != "" {
-									lidToNameMap[lidJID.String()] = phContact.BusinessName
-								}
-							}
-							break
-						}
-					}
-					
-					// If no phone found in devices, check if we got a VerifiedName
-					if _, exists := lidToPhoneMap[lidJID.String()]; !exists {
-						if info.VerifiedName != nil && info.VerifiedName.Details != nil {
-							lidToNameMap[lidJID.String()] = info.VerifiedName.Details.GetVerifiedName()
-							fmt.Printf("   📛 LID %s has verified name: %s\n", lidJID.User, info.VerifiedName.Details.GetVerifiedName())
-						}
-					}
-				}
-				break // Success, exit retry loop
-			}
-			
-			// Wait before next batch to avoid rate limiting
-			if end < len(lidJIDs) {
-				fmt.Printf("⏳ Waiting %v before next batch...\n", delayBetweenBatches)
-				time.Sleep(delayBetweenBatches)
-			}
-		}
-		
-		// Step 3: Build result with resolved data
+
 		for _, targetJID := range labeledJIDs {
 			jid, err := types.ParseJID(targetJID)
 			if err != nil {
@@ -219,33 +147,39 @@ func (h *Handler) SyncContacts(c *gin.Context) {
 				}
 			}
 			
-			// For LIDs, use resolved phone number
+			// Resolve LID to Phone Number using helper
 			if jid.Server == "lid" {
-				if phone, ok := lidToPhoneMap[jid.String()]; ok {
-					displayID = phone
-				}
-				if resolvedName, ok := lidToNameMap[jid.String()]; ok && resolvedName != "" {
-					name = resolvedName
-				}
-				// If still no name, use phone or LID as fallback
-				if name == jid.User && displayID != jid.User {
-					name = displayID // Use phone number as name if no name found
+				resolvedNum, err := utils.ResolveLIDToPhoneNumber(client.WAClient, jid)
+				if err == nil && resolvedNum != "" {
+					displayID = resolvedNum
+					// If name is still user ID, try to use resolved phone as name
+					if name == jid.User {
+						name = displayID
+					}
 				}
 			} else {
 				displayID = strings.Replace(displayID, "@s.whatsapp.net", "", -1)
 			}
 			
-			// Only add if we have a valid phone number (skip unresolved LIDs)
+			// Only add if we have a valid phone number or LID
 			if jid.Server == "lid" && displayID == jid.User {
-				fmt.Printf("⏭️ Skipping unresolved LID: %s\n", jid.User)
-				continue
+				// We allow LIDs now as they are valid for sending, but log it
+				// fmt.Printf("ℹ️  Unresolved LID: %s\n", jid.User)
+			}
+			
+			// Get Profile Picture (Sync version) - simplified for non-streaming
+			var profilePicUrl string
+			pic, _ := client.WAClient.GetProfilePictureInfo(ctx, jid, &whatsmeow.GetProfilePictureParams{Preview: true})
+			if pic != nil {
+				profilePicUrl = pic.URL
 			}
 
 			result = append(result, map[string]interface{}{
-				"id":    displayID,
-				"name":  name,
-				"phone": displayID,
-				"type":  "user",
+				"id":            displayID,
+				"name":          name,
+				"phone":         displayID,
+				"type":          "user",
+				"profilePicUrl": profilePicUrl,
 			})
 		}
 	} else {
@@ -484,6 +418,8 @@ func (h *Handler) SyncContactsStream(c *gin.Context) {
 	
 	// Collect LIDs for async profile pic fetch
 	var pendingPics []types.JID
+	// Map to track resolved ID for each LID to update correct item later
+	lidToResolvedID := make(map[string]string)
 	
 	for i, lidJID := range lidJIDs {
 		// Get contact info from store
@@ -501,14 +437,21 @@ func (h *Handler) SyncContactsStream(c *gin.Context) {
 			}
 		}
 		
-		// Use LID as the identifier - it's valid for sending messages
+		// RESOLVE LID TO PHONE NUMBER
+		resolvedNum, err := utils.ResolveLIDToPhoneNumber(client.WAClient, lidJID)
 		displayID := lidJID.User
+		if err == nil && resolvedNum != "" {
+			displayID = resolvedNum
+		}
+		
+		// Track mapping
+		lidToResolvedID[lidJID.User] = displayID
 		
 		// Send contact immediately (without waiting for profile pic)
 		sendEvent("contact", gin.H{
 			"id":            displayID,
 			"name":          name,
-			"phone":         displayID, // LID can be used to send messages
+			"phone":         displayID, // Use resolved number if available
 			"type":          "lid",
 			"isLID":         true,
 			"profilePicUrl": "", // Will be updated async
@@ -610,8 +553,14 @@ func (h *Handler) SyncContactsStream(c *gin.Context) {
 	// Process results in main thread (safe for c.Writer)
 	picCount := 0
 	for res := range results {
+		// Lookup the resolved ID to update the correct row on frontend
+		mappedID := res.ID
+		if resolved, ok := lidToResolvedID[res.ID]; ok {
+			mappedID = resolved
+		}
+
 		sendEvent("contact-update", gin.H{
-			"id":            res.ID,
+			"id":            mappedID,
 			"profilePicUrl": res.URL,
 		})
 		picCount++
