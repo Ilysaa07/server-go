@@ -446,62 +446,49 @@ func (h *Handler) SyncContactsStream(c *gin.Context) {
 
 	// Batch process ONLY uncached LIDs
 	if len(uncachedLIDs) > 0 {
-		batchSize := 2
-		// No fixed delay, we use dynamic backoff
+		batchSize := 1 // Single item for safety
+		networkDisabled := false // Circuit breaker
 		
 		for i := 0; i < len(uncachedLIDs); i += batchSize {
+			if networkDisabled {
+				break // Stop processing network requests
+			}
+
 			end := i + batchSize
 			if end > len(uncachedLIDs) {
 				end = len(uncachedLIDs)
 			}
 			batch := uncachedLIDs[i:end]
 			
-			// Retry Logic with Exponential Backoff
-			maxRetries := 5
-			baseDelay := 2 * time.Second
-			success := false
-			
-			for attempt := 0; attempt < maxRetries; attempt++ {
-				// fmt.Printf("🔄 Resolving batch %d-%d (Attempt %d)...\n", i+1, end, attempt+1)
-				
-				resp, err := client.WAClient.GetUserInfo(ctx, batch)
-				if err != nil {
-					// Check for rate limit
-					isRateLimit := strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate-overlimit")
-					
-					wait := baseDelay * time.Duration(1<<attempt) // 2s, 4s, 8s...
-					if isRateLimit {
-						fmt.Printf("⚠️ Rate Limit (429). Waiting %v...\n", wait)
-					} else {
-						fmt.Printf("⚠️ Network Error: %v. Waiting %v...\n", err, wait)
-					}
-					
-					time.Sleep(wait)
+			// Try Network Resolution
+			resp, err := client.WAClient.GetUserInfo(ctx, batch)
+			if err != nil {
+				if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate-overlimit") {
+					fmt.Printf("⚠️ Rate Limit Hit (429). Circuit Breaker Activated. Switching to local-only for remaining %d LIDs.\n", len(uncachedLIDs)-i)
+					networkDisabled = true
 					continue
 				}
+				// Other network error - just log and continue (maybe wait a bit)
+				fmt.Printf("⚠️ Network Error on batch: %v\n", err)
+				time.Sleep(1 * time.Second) // Light delay
+				continue
+			}
 				
-				// Success
-				for lidJID, info := range resp {
-					for _, device := range info.Devices {
-						if device.Server == "s.whatsapp.net" {
-							// Update Map & Cache
-							lidToResolvedID[lidJID.User] = device.User
-							lidCache.Set(lidJID.User, device.User)
-							fmt.Printf("   ✅ Resolved: %s -> %s\n", lidJID.User, device.User)
-							break
-						}
+			// Success
+			for lidJID, info := range resp {
+				for _, device := range info.Devices {
+					if device.Server == "s.whatsapp.net" {
+						// Update Map & Cache
+						lidToResolvedID[lidJID.User] = device.User
+						lidCache.Set(lidJID.User, device.User)
+						fmt.Printf("   ✅ Resolved: %s -> %s\n", lidJID.User, device.User)
+						break
 					}
 				}
-				success = true
-				break
 			}
 			
-			if !success {
-				fmt.Printf("❌ Failed to resolve batch completely after retries.\n")
-			}
-			
-			// Small basic delay between successful batches too
-			time.Sleep(1 * time.Second)
+			// Respectful delay between successful requests
+			time.Sleep(2 * time.Second)
 		}
 	}
 
