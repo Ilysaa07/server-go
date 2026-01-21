@@ -512,9 +512,13 @@ func (h *Handler) SyncContactsStream(c *gin.Context) {
 			}
 
 			// Process successful responses
+			fmt.Printf("📦 [SSE] GetUserInfo returned %d responses\n", len(resp))
 			for lidJID, info := range resp {
+				fmt.Printf("🔍 LID %s: Devices=%d, VerifiedName=%v\n", lidJID.User, len(info.Devices), info.VerifiedName != nil)
+				
 				phone := ""
 				for _, device := range info.Devices {
+					fmt.Printf("   📱 Device: Server=%s, User=%s\n", device.Server, device.User)
 					if device.Server == "s.whatsapp.net" {
 						phone = device.User
 						break
@@ -522,6 +526,7 @@ func (h *Handler) SyncContactsStream(c *gin.Context) {
 				}
 
 				if phone == "" {
+					fmt.Printf("   ⚠️ No phone found for LID %s, skipping\n", lidJID.User)
 					continue // Skip unresolved LIDs
 				}
 
