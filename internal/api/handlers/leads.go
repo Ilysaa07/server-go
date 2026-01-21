@@ -477,86 +477,44 @@ func (h *Handler) SyncContactsStream(c *gin.Context) {
 		processedCount++
 	}
 
-	// Process LIDs in batches with rate limiting
-	batchSize := 10  // Increased for faster processing
-	delayBetweenBatches := 2 * time.Second  // Reduced delay, rely on retry for rate limits
-
-	for i := 0; i < len(lidJIDs); i += batchSize {
-		end := i + batchSize
-		if end > len(lidJIDs) {
-			end = len(lidJIDs)
+	// Process LIDs - get contact info from store directly (GetUserInfo doesn't return phone mapping)
+	fmt.Printf("🏷️ Processing %d LIDs directly from contact store\n", len(lidJIDs))
+	
+	for i, lidJID := range lidJIDs {
+		// Get contact info from store
+		contact, _ := client.WAClient.Store.Contacts.GetContact(ctx, lidJID)
+		
+		// Determine name
+		name := lidJID.User // Default to LID user part
+		if contact.Found {
+			if contact.PushName != "" {
+				name = contact.PushName
+			} else if contact.FullName != "" {
+				name = contact.FullName
+			} else if contact.BusinessName != "" {
+				name = contact.BusinessName
+			}
 		}
-		batch := lidJIDs[i:end]
-
-		sendEvent("progress", gin.H{
-			"current": processedCount,
-			"total":   len(labeledJIDs),
-			"message": fmt.Sprintf("Processing batch %d-%d", i+1, end),
+		
+		// Use LID as the identifier - it's valid for sending messages
+		displayID := lidJID.User
+		
+		sendEvent("contact", gin.H{
+			"id":       displayID,
+			"name":     name,
+			"phone":    displayID, // LID can be used to send messages
+			"type":     "lid",
+			"isLID":    true,
 		})
-
-		// Retry logic with exponential backoff
-		maxRetries := 3
-		retryDelay := 3 * time.Second
-
-		for retry := 0; retry < maxRetries; retry++ {
-			resp, err := client.WAClient.GetUserInfo(ctx, batch)
-			if err != nil {
-				if strings.Contains(err.Error(), "rate-overlimit") || strings.Contains(err.Error(), "429") {
-					sendEvent("progress", gin.H{"message": fmt.Sprintf("Rate limited, waiting %v...", retryDelay)})
-					time.Sleep(retryDelay)
-					retryDelay *= 2
-					continue
-				}
-				fmt.Printf("❌ GetUserInfo batch failed: %v\n", err)
-				break
-			}
-
-			// Process successful responses
-			fmt.Printf("📦 [SSE] GetUserInfo returned %d responses\n", len(resp))
-			for lidJID, info := range resp {
-				fmt.Printf("🔍 LID %s: Devices=%d, VerifiedName=%v\n", lidJID.User, len(info.Devices), info.VerifiedName != nil)
-				
-				phone := ""
-				for _, device := range info.Devices {
-					fmt.Printf("   📱 Device: Server=%s, User=%s\n", device.Server, device.User)
-					if device.Server == "s.whatsapp.net" {
-						phone = device.User
-						break
-					}
-				}
-
-				if phone == "" {
-					fmt.Printf("   ⚠️ No phone found for LID %s, skipping\n", lidJID.User)
-					continue // Skip unresolved LIDs
-				}
-
-				// Try to get name
-				name := phone
-				if phContact, err := client.WAClient.Store.Contacts.GetContact(ctx, types.JID{User: phone, Server: "s.whatsapp.net"}); err == nil && phContact.Found {
-					if phContact.FullName != "" {
-						name = phContact.FullName
-					} else if phContact.PushName != "" {
-						name = phContact.PushName
-					} else if phContact.BusinessName != "" {
-						name = phContact.BusinessName
-					}
-				}
-
-				sendEvent("contact", gin.H{
-					"id":    phone,
-					"name":  name,
-					"phone": phone,
-					"type":  "user",
-					"lidResolved": lidJID.User,
-				})
-				processedCount++
-			}
-			break // Success, exit retry loop
-		}
-
-		// Wait before next batch to avoid rate limiting
-		if end < len(lidJIDs) {
-			time.Sleep(delayBetweenBatches)
+		processedCount++
+		
+		// Send progress every 20 contacts
+		if (i+1) % 20 == 0 {
+			sendEvent("progress", gin.H{
+				"current": processedCount,
+				"total":   len(labeledJIDs),
+				"message": fmt.Sprintf("Processed %d/%d contacts", processedCount, len(labeledJIDs)),
+			})
 		}
 	}
 
