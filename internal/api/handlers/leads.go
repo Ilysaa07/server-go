@@ -122,11 +122,11 @@ func (h *Handler) SyncContacts(c *gin.Context) {
 		
 		fmt.Printf("🏷️ Found %d LIDs and %d regular JIDs\n", len(lidJIDs), len(regularJIDs))
 		
-		// Step 2: Batch resolve LIDs (max 5 per batch to avoid rate limit)
+		// Step 2: Batch resolve LIDs (max 3 per batch to avoid rate limit)
 		lidToPhoneMap := make(map[string]string) // LID -> Phone number
 		lidToNameMap := make(map[string]string)  // LID -> Name
-		batchSize := 5
-		delayBetweenBatches := 2 * time.Second
+		batchSize := 3
+		delayBetweenBatches := 5 * time.Second
 		
 		for i := 0; i < len(lidJIDs); i += batchSize {
 			end := i + batchSize
