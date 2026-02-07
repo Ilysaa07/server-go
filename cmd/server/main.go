@@ -15,7 +15,7 @@ import (
 )
 
 func main() {
-	fmt.Println("\n🚀 Initializing WhatsApp Server (Go)...")
+	fmt.Println("\n🚀 Initializing Valpro Server (Go)...")
 	fmt.Println("=========================================")
 	fmt.Printf("📌 Running as Go/whatsmeow (socket-based)\n")
 	fmt.Printf("📌 Session: SQLite (local)\n")
@@ -79,7 +79,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Start server
+	// Start server	
 	if err := server.Start(); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}

@@ -33,6 +33,7 @@ type NewMessageEvent struct {
 	ChatName  string `json:"chatName"`
 	HasMedia  bool   `json:"hasMedia"`
 	Type      string `json:"type"`
+	QuotedMsgBody string `json:"quotedMsgBody,omitempty"`
 }
 
 // Helper function to encode bytes to base64

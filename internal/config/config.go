@@ -37,6 +37,7 @@ type Config struct {
 	ContentfulManagementToken  string
 	ContentfulSpaceID          string
 	ContentfulEnvironment      string
+	AgentPhone                 string
 }
 
 // Load reads configuration from environment variables
@@ -76,6 +77,7 @@ func Load() *Config {
 		ContentfulManagementToken:  getEnv("CONTENTFUL_MANAGEMENT_TOKEN", ""),
 		ContentfulSpaceID:          getEnv("CONTENTFUL_SPACE_ID", ""),
 		ContentfulEnvironment:      getEnv("CONTENTFUL_ENVIRONMENT", "master"),
+		AgentPhone:                 getEnv("AGENT_PHONE", ""),
 	}
 
 	return cfg

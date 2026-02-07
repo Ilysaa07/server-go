@@ -55,7 +55,7 @@ cd server-go
     nano .env
     ```
     *   Set `PORT=8080` (or 3000)
-    *   Set `WA_API_KEY` (Strong secret)
+    *   Set `VALPRO_API_KEY` (Strong secret)
 
 2.  **Upload Credentials**:
     Use SCP to upload your Firebase JSON to simple path:

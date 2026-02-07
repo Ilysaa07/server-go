@@ -19,17 +19,19 @@ type Handler struct {
 	Repo               *firestore.ChatsRepository
 	BusinessClientRepo *firestore.BusinessClientRepository
 	ClientDocsRepo     *firestore.ClientDocumentRepository
+	SettingsRepo       *firestore.SettingsRepository
 	WSHub              *websocket.Hub
 }
 
 // NewHandler creates a new handler with dependencies
-func NewHandler(cfg *config.Config, waManager *whatsapp.Manager, repo *firestore.ChatsRepository, clientRepo *firestore.BusinessClientRepository, docRepo *firestore.ClientDocumentRepository, wsHub *websocket.Hub) *Handler {
+func NewHandler(cfg *config.Config, waManager *whatsapp.Manager, repo *firestore.ChatsRepository, clientRepo *firestore.BusinessClientRepository, docRepo *firestore.ClientDocumentRepository, settingsRepo *firestore.SettingsRepository, wsHub *websocket.Hub) *Handler {
 	return &Handler{
 		Config:             cfg,
 		WAManager:          waManager,
 		Repo:               repo,
 		BusinessClientRepo: clientRepo,
 		ClientDocsRepo:     docRepo,
+		SettingsRepo:       settingsRepo,
 		WSHub:              wsHub,
 	}
 }

@@ -1,12 +1,15 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"time"
 
 	"wa-server-go/internal/api/handlers"
 	"wa-server-go/internal/api/middleware"
 	"wa-server-go/internal/api/websocket"
+	"wa-server-go/internal/chatbot"
 	"wa-server-go/internal/config"
 	"wa-server-go/internal/firestore"
 	"wa-server-go/internal/whatsapp"
@@ -16,12 +19,14 @@ import (
 
 // Server represents the HTTP server
 type Server struct {
-	Config    *config.Config
-	Router    *gin.Engine
-	WSHub     *websocket.Hub
-	WAManager *whatsapp.Manager
-	Handler   *handlers.Handler
-	Repo      *firestore.ChatsRepository
+	Config      *config.Config
+	Router      *gin.Engine
+	WSHub       *websocket.Hub
+	WAManager   *whatsapp.Manager
+	Handler     *handlers.Handler
+	Repo        *firestore.ChatsRepository
+	ChatHub     *chatbot.ChatHub
+	ChatHandler *chatbot.Handler
 }
 
 // NewServer creates a new HTTP server
@@ -39,17 +44,27 @@ func NewServer(cfg *config.Config, waManager *whatsapp.Manager, repo *firestore.
 	// Create business client repositories
 	clientRepo := firestore.NewBusinessClientRepository(repo.GetClient())
 	docRepo := firestore.NewClientDocumentRepository(repo.GetClient())
+	leadsRepo := firestore.NewLeadsRepository(repo.GetClient())
+	settingsRepo := firestore.NewSettingsRepository(repo.GetClient())
 
 	// Create handlers
-	handler := handlers.NewHandler(cfg, waManager, repo, clientRepo, docRepo, wsHub)
+	handler := handlers.NewHandler(cfg, waManager, repo, clientRepo, docRepo, settingsRepo, wsHub)
+
+	// Initialize Chatbot components
+	chatEngine := chatbot.NewChatEngine(cfg.GroqAPIKey)
+	sessionManager := chatbot.NewSessionManager(repo.GetClient().FS, chatEngine)
+	chatHub := chatbot.NewChatHub()
+	chatHandler := chatbot.NewHandler(sessionManager, chatHub, leadsRepo, settingsRepo, waManager, cfg)
 
 	server := &Server{
-		Config:    cfg,
-		Router:    router,
-		WSHub:     wsHub,
-		WAManager: waManager,
-		Handler:   handler,
-		Repo:      repo,
+		Config:      cfg,
+		Router:      router,
+		WSHub:       wsHub,
+		WAManager:   waManager,
+		Handler:     handler,
+		Repo:        repo,
+		ChatHub:     chatHub,
+		ChatHandler: chatHandler,
 	}
 
 
@@ -103,6 +118,10 @@ func (s *Server) setupRoutes() {
 		protected.POST("/trigger-backup", s.Handler.TriggerBackup)
 		protected.POST("/api/blog/manual-trigger", s.Handler.TriggerBlog)
 		protected.POST("/sync-invoices", s.Handler.SyncInvoices)
+		
+		// Settings Endpoints
+		protected.GET("/settings/whatsapp", s.Handler.GetWhatsAppSettings)
+		protected.POST("/settings/whatsapp", s.Handler.UpdateWhatsAppSettings)
 
 		// Business Client Endpoints
 		protected.POST("/clients", s.Handler.CreateClient)
@@ -141,11 +160,40 @@ func (s *Server) setupRoutes() {
 			portalProtected.GET("/dashboard", s.Handler.GetPortalDashboard)
 			// Add document download for portal users here if different from admin
 			portalProtected.GET("/documents/:documentId/download", s.Handler.DownloadDocument) 
-			// Wait, DownloadDocument was in documents.go and I deleted it.
-			// I need to implement DownloadDocument in handlers if I want it usable.
-			// I deleted `documents.go` so `DownloadDocument` is GONE.
-			// I need to re-implement `DownloadDocument` in `business_clients.go` or `portal.go`.
 		}
+	}
+
+	// ============ PUBLIC CHAT WIDGET ROUTES ============
+	// These are public endpoints for the website chat widget
+	chat := s.Router.Group("/chat")
+	chat.Use(middleware.CORSMiddleware(s.Config.AllowedDomains))
+	{
+		chat.POST("/start", s.ChatHandler.StartChat)
+		chat.POST("/message", s.ChatHandler.SendMessage)
+		chat.POST("/handover", s.ChatHandler.RequestHandover)
+		chat.POST("/return-to-bot", s.ChatHandler.VisitorReturnToBot)
+		chat.POST("/end-session", s.ChatHandler.VisitorEndSession)
+		chat.GET("/history/:sessionId", s.ChatHandler.GetMessages)
+		chat.GET("/ws/:sessionId", s.ChatHub.HandleVisitorWS)
+	}
+
+	// ============ ADMIN LIVE CHAT ROUTES ============
+	// These require API key authentication
+	adminChat := protected.Group("/admin-chat")
+	{
+		adminChat.GET("/queue", s.ChatHandler.GetQueue)
+		adminChat.POST("/claim/:sessionId", s.ChatHandler.ClaimChat)
+		adminChat.POST("/close/:sessionId", s.ChatHandler.CloseChat)
+		adminChat.POST("/return-to-bot/:sessionId", s.ChatHandler.ReturnToBot)
+		adminChat.POST("/message", s.ChatHandler.AdminSendMessage)
+		adminChat.GET("/ws", s.ChatHub.HandleAdminWS)
+	}
+
+	// Admin Status endpoints
+	adminStatus := protected.Group("/admin-status")
+	{
+		adminStatus.POST("/update", s.ChatHandler.UpdateAdminStatus)
+		adminStatus.GET("/online", s.ChatHandler.GetOnlineAdmins)
 	}
 }
 
@@ -154,11 +202,25 @@ func (s *Server) Start() error {
 	// Start WebSocket hub
 	go s.WSHub.Run()
 
+	// Start Chat WebSocket hub
+	go s.ChatHub.Run()
+
 	// Start event forwarders
 	go s.forwardEvents()
 
+	// Start cleanup job (runs every minute, cleans sessions inactive for 6 mins)
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		for range ticker.C {
+			if err := s.ChatHandler.CleanupSessions(context.Background(), 6*time.Minute); err != nil {
+				log.Printf("⚠️ Failed to cleanup sessions: %v", err)
+			}
+		}
+	}()
+
 	addr := fmt.Sprintf(":%s", s.Config.Port)
 	log.Printf("✅ WhatsApp Server listening on port %s", s.Config.Port)
+	log.Printf("💬 Chat widget endpoints available at /chat/*")
 	return s.Router.Run(addr)
 }
 
@@ -173,6 +235,10 @@ func (s *Server) forwardEvents() {
 			s.WSHub.Broadcast("status-update", status)
 
 		case msg := <-s.WAManager.MessageChannel():
+			// BRIDGE: Check for Agent Reply to Web Visitor
+			go s.ChatHandler.HandleAgentReply(msg)
+			
+			// Broadcast to Dashboard
 			s.WSHub.Broadcast("new-message", msg)
 		}
 	}

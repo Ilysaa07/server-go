@@ -118,19 +118,42 @@ func (m *Manager) handleEvent(clientID string, client *Client, evt interface{}) 
 			senderName = v.Info.PushName
 		}
 
+
+		// Extract Quoted Message Body (for Bridge)
+		quotedMsgBody := ""
+		var contextInfo *waProto.ContextInfo
+
+		if msg.ExtendedTextMessage != nil {
+			contextInfo = msg.ExtendedTextMessage.ContextInfo
+		} else if msg.ImageMessage != nil {
+			contextInfo = msg.ImageMessage.ContextInfo
+		} else if msg.DocumentMessage != nil {
+			contextInfo = msg.DocumentMessage.ContextInfo
+		}
+
+		if contextInfo != nil && contextInfo.QuotedMessage != nil {
+			qMsg := contextInfo.QuotedMessage
+			if qMsg.Conversation != nil {
+				quotedMsgBody = *qMsg.Conversation
+			} else if qMsg.ExtendedTextMessage != nil && qMsg.ExtendedTextMessage.Text != nil {
+				quotedMsgBody = *qMsg.ExtendedTextMessage.Text
+			}
+		}
+
 		// Send to websocket
 		m.msgChan <- NewMessageEvent{
-			Client:    clientID,
-			ID:        v.Info.ID,
-			From:      v.Info.Sender.String(),
-			To:        v.Info.Chat.String(),
-			Body:      body,
-			Timestamp: v.Info.Timestamp.Unix(),
-			FromMe:    v.Info.IsFromMe,
-			ChatID:    v.Info.Chat.String(),
-			ChatName:  senderName,
-			HasMedia:  hasMedia,
-			Type:      msgType,
+			Client:        clientID,
+			ID:            v.Info.ID,
+			From:          v.Info.Sender.String(),
+			To:            v.Info.Chat.String(),
+			Body:          body,
+			Timestamp:     v.Info.Timestamp.Unix(),
+			FromMe:        v.Info.IsFromMe,
+			ChatID:        v.Info.Chat.String(),
+			ChatName:      senderName,
+			HasMedia:      hasMedia,
+			Type:          msgType,
+			QuotedMsgBody: quotedMsgBody,
 		}
 
 		// Save to Firestore if Repo is configured
